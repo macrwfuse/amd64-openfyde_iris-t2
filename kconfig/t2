@@ -1,0 +1,22 @@
+# T2 chip support — kernel config fragment for kernel 6.1
+#
+# Source: t2linux/linux-t2-patches @ 1918b48 ("6.1 wifi patches")
+#         (repo main branch targets 7.2.3; 1918b48 is the 6.1 baseline,
+#          which matches openFyde r114's chromeos-kernel-6_1)
+#
+# These five options are the symbols introduced by the 6.1 patch set and
+# are required for T2 Mac support. They mirror the upstream extra_config.
+#
+# Options already enabled in kernel-6_1-def-r1 and therefore NOT repeated:
+#   CONFIG_HID_APPLE=m            (keyboard/backlight base driver)
+#   CONFIG_HID_MAGICMOUSE=m       (T2 trackpad via magicmouse path)
+#   CONFIG_SENSORS_APPLESMC=m     (SMC: fan control / sensors)
+#   CONFIG_MOUSE_BCM5974=m        (bcm5974 trackpad)
+#   CONFIG_BT_BCM=m               (Broadcom Bluetooth)
+#   CONFIG_BRCMFMAC=m             (Broadcom Wi-Fi)
+#   CONFIG_DRM_FBDEV_EMULATION=y  (required by 7001 fbdev discard patch)
+CONFIG_APPLE_BCE=m
+CONFIG_HID_APPLE_IBRIDGE=m
+CONFIG_HID_APPLE_TOUCHBAR=m
+CONFIG_HID_APPLE_MAGIC_BACKLIGHT=m
+CONFIG_BT_HCIBCM4377=m

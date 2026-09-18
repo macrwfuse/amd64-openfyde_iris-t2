@@ -1,0 +1,82 @@
+# obsolete-upstream/ — patches that are NOT applied
+
+Two patches from the t2linux 6.1 set are excluded because their changes are
+already present in the kernel this board builds. Applying them fails with
+"Reversed (or previously applied) patch detected".
+
+They are kept here, unapplied, so the delta against t2linux stays auditable.
+
+The parent `files/` directory is what cros-kernel2's `apply_private_patches`
+globs (`${FILESDIR}/*.patch`). This subdirectory is never matched — the glob
+does not descend — so nothing here reaches the build.
+
+---
+
+## 4002-HID-apple-fix-key-translations-where-multiple-quirks.patch
+
+    sha256  7d27bd83133c2e883e854271c5f9f698c61196afc2922921675353303194ef2c
+
+| | |
+|---|---|
+| Subject | HID: apple: fix key translations where multiple quirks attempt to translate the same key |
+| Author | Kerem Karabay <kekrby@gmail.com> |
+| Authored | 2022-09-24 |
+| t2linux source | `linux-t2-patches` @ `1918b48`; file last touched in `1137ce0` (2022-10-04, "6.0") |
+| Patch's own `From:` sha | `07a714fc9a7ac7d9313816c365a8c2fd7ee9cb81` |
+| Merged upstream as | `5476fcf7f7b901db1cea92acb1abdd12609e30e1` (committed 2022-11-02) |
+| First mainline release | **v6.2** (absent in v6.1) |
+| Backported to stable as | `508cc67f944905b7a777d6e70d0e6f9962c3c6e3` (2022-12-31) |
+| First stable release | **v6.1.2** |
+
+Note the `From:` sha in the patch file is the pre-merge mailing-list revision
+(v2 1/2). It does **not** exist in mainline — the maintainer's applied commit
+has a different sha, which is the one listed above.
+
+## 4003-HID-apple-enable-APPLE_ISO_TILDE_QUIRK-for-the-keybo.patch
+
+    sha256  4db195e0bda5712e60a78266c1458037063e5debd646b08376c4700a27d4b4ef
+
+| | |
+|---|---|
+| Subject | HID: apple: enable APPLE_ISO_TILDE_QUIRK for the keyboards of Macs with the T2 chip |
+| Author | Kerem Karabay <kekrby@gmail.com> |
+| Authored | 2022-09-24 |
+| t2linux source | `linux-t2-patches` @ `1918b48`; file last touched in `18d3466` (2022-09-25, "Update 4002 and 4003") |
+| Patch's own `From:` sha | `2680cfe2fd7e3f829c2d82cda38d04a9d269ea7f` |
+| Merged upstream as | `084bc074c231e716cbcb9e8f9db05b17fd3563cf` (committed 2022-11-02) |
+| First mainline release | **v6.2** (absent in v6.1) |
+| Backported to stable as | `15e6830642e6d71fe5850b83ec7a20699e960706` (2022-12-31) |
+| First stable release | **v6.1.2** |
+
+The two patches are the v2 pair (1/2, 2/2) of a single series and were merged
+minutes apart, so they share a landing point.
+
+---
+
+## Evidence in the tree this board actually builds
+
+Verified against ChromiumOS's kernel, `chromiumos/third_party/kernel` at the
+exact commit this board pins (`6a8a0d280f118a3f901ed2976255fef57b8261ba`,
+branch `chromeos-6.1`) — not a vanilla kernel:
+
+    4002  drivers/hid/hid-apple.c:389
+            trans = apple_find_translation(swapped_fn_leftctrl_keys, code);
+
+    4003  drivers/hid/hid-apple.c:999-1014 — all eight WELLSPRINGT2 entries
+          carry APPLE_ISO_TILDE_QUIRK:
+            J140K, J132, J680, J213   (APPLE_HAS_FN | APPLE_BACKLIGHT_CTL | APPLE_ISO_TILDE_QUIRK)
+            J214K, J223, J230K, J152F (APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK)
+
+Because the backport landed in 6.1.2, both changes are present across the
+whole range of 6.1.y that openFyde R114 could build (6.1.25 here). They were
+never needed for this board.
+
+## Re-checking after a kernel bump
+
+`verify-upstreamed.sh` re-runs these checks against any kernel tree:
+
+    ./verify-upstreamed.sh /path/to/linux
+
+It reports, per patch, whether the change is already present. If a future
+kernel ever *drops* either change, the corresponding patch must be moved back
+to `../files/` — that is the only reason to keep these files around.

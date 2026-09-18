@@ -1,0 +1,10 @@
+# This overlay is consumed by the ChromiumOS/Portage build system and the
+# kernel patches are fed to `git apply`. Both require LF endings.
+#
+# The repo is commonly checked out on Windows where a global
+# `core.autocrlf=true` rewrites LF -> CRLF in the working tree. That silently
+# breaks things: `git apply` rejects CRLF patches with a misleading context
+# mismatch, a shell script with a CRLF shebang fails with "bad interpreter",
+# and a sourced make.conf picks up a trailing \r in variable values.
+* text=auto eol=lf
+*.patch text eol=lf

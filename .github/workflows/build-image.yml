@@ -1,0 +1,172 @@
+name: Build openFyde image (self-hosted)
+
+# Full image build. This CANNOT run on GitHub-hosted runners.
+#
+# openFyde's own build docs give the floor: at least 150GB free disk (200GB+
+# recommended), 16GB+ RAM, and 5-10+ hours -- Chromium alone needs 8-28GB to
+# link. A hosted ubuntu-latest runner has ~14GB free disk, 16GB RAM and a
+# 6 hour job limit, and `cros_sdk` additionally needs a privileged chroot with
+# bind mounts. There is no configuration of a hosted runner that makes this
+# work.
+#
+# REQUIRED RUNNER SETUP (not provided by this repo):
+#   - A Linux x86_64 machine, 200GB+ free disk, 16GB+ RAM (32GB+ recommended)
+#   - ChromiumOS SDK already fetched and initialised:
+#       repo init -u https://github.com/openFyde/manifest -b <release>
+#       repo sync -j8
+#   - The SDK checkout path set as the SDK_ROOT variable below
+#   - A self-hosted runner registered with the labels: self-hosted, linux, x64
+#
+# Because no such runner exists by default, this workflow simply queues when
+# triggered and never runs. That is intentional -- it is opt-in.
+#
+# UNTESTED: this workflow has never been executed. The build commands are taken
+# verbatim from openFyde's getting-started guide, but the step wiring around
+# them has not been run against a real SDK.
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: 'Board to build'
+        required: true
+        default: 'amd64-openfyde_iris-t2'
+      upload_image:
+        description: 'Upload the built image as a workflow artifact'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  # Absolute path to the initialised ChromiumOS SDK checkout on the runner.
+  # Override per-runner by setting a repository variable named SDK_ROOT.
+  SDK_ROOT: ${{ vars.SDK_ROOT || '/mnt/cros-sdk' }}
+  BOARD: ${{ inputs.board }}
+
+jobs:
+  build:
+    name: Build ${{ inputs.board }} image
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 900
+
+    steps:
+      - name: Check runner prerequisites
+        run: |
+          set -euo pipefail
+          echo "SDK_ROOT=${SDK_ROOT}"
+          [ -d "${SDK_ROOT}" ] || { echo "::error::SDK_ROOT does not exist on this runner"; exit 1; }
+          [ -d "${SDK_ROOT}/src/scripts" ] || { echo "::error::${SDK_ROOT} is not a ChromiumOS SDK checkout"; exit 1; }
+          df -h "${SDK_ROOT}" | tail -1
+          free -g | head -2
+          command -v cros_sdk >/dev/null || { echo "::error::cros_sdk not on PATH (is depot_tools set up?)"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          path: overlay-src
+
+      - name: Install the board overlay into the SDK
+        run: |
+          set -euo pipefail
+          DEST="${SDK_ROOT}/src/overlays/overlay-${BOARD}"
+          rm -rf "${DEST}"
+          mkdir -p "${DEST}"
+          # Copy the overlay tree without any VCS metadata.
+          ( cd overlay-src && tar --exclude=.git -cf - . ) | ( cd "${DEST}" && tar -xf - )
+          echo "installed overlay -> ${DEST}"
+          ls "${DEST}" | sed 's/^/  /'
+
+      - name: Verify the SDK ships no newer chromeos-kernel-6_1
+        run: |
+          set -euo pipefail
+          # If the SDK's chromiumos-overlay has a version above 6.1.25, portage
+          # will prefer it over the board's r228 override, FILESDIR will point
+          # at upstream's empty files/, and the T2 patches will silently not
+          # apply. Fail before burning hours on a build that cannot work.
+          cd "${SDK_ROOT}/src/overlays/chromiumos-overlay/sys-kernel/chromeos-kernel-6_1"
+          highest=$(ls chromeos-kernel-6_1-*.ebuild | grep -v -- '-9999' | sort -V | tail -1)
+          echo "highest kernel ebuild in SDK: ${highest}"
+          echo "board override             : chromeos-kernel-6_1-6.1.25-r228.ebuild"
+          case "${highest}" in
+            chromeos-kernel-6_1-6.1.25-*)
+              echo "::notice::SDK is on 6.1.25; the board's r228 override still wins" ;;
+            *)
+              echo "::error::SDK ships ${highest}, which outranks the board override. Re-copy the upstream ebuild into the board overlay, bump its revision, and re-verify the patch stack."
+              exit 1 ;;
+          esac
+
+      - name: Build packages
+        run: |
+          set -euo pipefail
+          # Commands per openFyde's getting-started guide, run inside the chroot.
+          cros_sdk -- bash -lc '
+            set -euo pipefail
+            cd ~/trunk/src/scripts
+            setup_board --board='"${BOARD}"'
+            sudo emerge capnproto
+            ./build_packages --board='"${BOARD}"' --nowithautotest --autosetgov --nouse_any_chrome
+          '
+
+      - name: Assert portage selected the board kernel override
+        run: |
+          set -euo pipefail
+          # The whole point of the override ebuild is that it is the selected
+          # one -- that is what makes FILESDIR point at the T2 patches. Check it
+          # now rather than after a long image build.
+          cros_sdk -- bash -lc '
+            set -euo pipefail
+            equery-'"${BOARD}"' which sys-kernel/chromeos-kernel-6_1
+          ' | tee /tmp/selected-ebuild.txt
+          if ! grep -q '6\.1\.25-r228' /tmp/selected-ebuild.txt; then
+            echo "::error::portage did not select the board override; the image would build WITHOUT T2 support"
+            exit 1
+          fi
+          echo "::notice::board override r228 selected"
+
+      - name: Assert the T2 drivers were built
+        run: |
+          set -euo pipefail
+          # Confirm the patched drivers actually landed as modules in the
+          # board's build tree, not merely that the patches applied.
+          cros_sdk -- bash -lc '
+            set -euo pipefail
+            B=/build/'"${BOARD}"'
+            rc=0
+            for m in apple_bce apple-ibridge apple-touchbar apple-magic-backlight hci_bcm4377 applesmc bcm5974; do
+              if find "${B}" -name "${m}.ko" | grep -q .; then
+                echo "  ok      ${m}.ko"
+              else
+                echo "::error::${m}.ko not built"
+                rc=1
+              fi
+            done
+            exit $rc
+          '
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          cros_sdk -- bash -lc '
+            set -euo pipefail
+            cd ~/trunk/src/scripts
+            ./build_image --board='"${BOARD}"' --noenable_rootfs_verification
+          '
+
+      - name: Collect image
+        run: |
+          set -euo pipefail
+          SRC="${SDK_ROOT}/src/build/images/${BOARD}/latest/chromiumos_image.bin"
+          [ -f "${SRC}" ] || { echo "::error::image not found at ${SRC}"; exit 1; }
+          mkdir -p out
+          cp "${SRC}" "out/${BOARD}.bin"
+          ls -lh out/
+          sha256sum "out/${BOARD}.bin" | tee out/SHA256SUMS
+
+      - name: Upload image
+        if: ${{ inputs.upload_image }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.board }}-image
+          path: out/
+          retention-days: 14

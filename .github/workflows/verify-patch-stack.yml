@@ -1,0 +1,270 @@
+name: Verify T2 patch stack
+
+# The real failure mode for this board is silent: if the T2 patches stop
+# applying, or if portage stops selecting the override ebuild, the image
+# builds fine but with no T2 support. These checks catch that.
+#
+# The full image build needs the ChromiumOS SDK and cannot run on hosted
+# runners -- see build-image.yml for that.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, to catch upstream drift without anyone touching the repo.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  patch-stack:
+    name: Patches apply to kernel 6.1.25
+    runs-on: ubuntu-latest
+    env:
+      KVER: 6.1.25
+      # Gentoo's eapply runs patch at its default fuzz of 2. Keep in sync
+      # with README.t2.md.
+      EAPPLY_FUZZ: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache kernel tarball
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kernels
+          key: linux-${{ env.KVER }}-tarball
+
+      - name: Fetch kernel ${{ env.KVER }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/kernels"
+          tb="${RUNNER_TEMP}/kernels/linux-${KVER}.tar.xz"
+          if [ ! -f "${tb}" ]; then
+            curl -sSL --retry 3 --max-time 900 -o "${tb}" \
+              "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KVER}.tar.xz"
+          fi
+          mkdir -p "${RUNNER_TEMP}/k"
+          tar -xf "${tb}" -C "${RUNNER_TEMP}/k" --strip-components=1
+          echo "kernel tree: $(ls "${RUNNER_TEMP}/k" | wc -l) entries"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' "${RUNNER_TEMP}/k/Makefile" | tr '\n' ' '
+          echo
+
+      - name: Apply T2 patch stack at eapply's fuzz tolerance
+        run: |
+          set -uo pipefail
+          PATCHDIR="sys-kernel/chromeos-kernel-6_1/files"
+          cd "${RUNNER_TEMP}/k"
+
+          clean=0; fuzzed=0; redundant=0; failed=0
+          failed_list=""; redundant_list=""
+
+          for p in "$GITHUB_WORKSPACE/${PATCHDIR}"/*.patch; do
+            n=$(basename "$p")
+
+            # Preferred: exact apply, no fuzz.
+            if git apply "$p" 2>/dev/null; then
+              echo "clean     ${n}"; clean=$((clean+1)); continue
+            fi
+
+            # Fallback: GNU patch at its default fuzz, i.e. what eapply does.
+            # Deliberately no --forward: a reversed patch must fail here,
+            # exactly as it would in the real build.
+            out=$(patch -p1 --fuzz="${EAPPLY_FUZZ}" < "$p" 2>&1); rc=$?
+
+            # Hard failures are checked FIRST. A patch can skip an
+            # already-applied hunk and hard-fail another in the same run --
+            # 8002 did exactly that before its redundant hunks were trimmed.
+            # Testing "previously applied" first hides the real breakage.
+            if [ $rc -ne 0 ] || grep -qE "FAILED at|hunk.*FAILED|malformed" <<<"$out"; then
+              echo "FAILED    ${n}"
+              grep -E "FAILED|malformed" <<<"$out" | head -2 | sed 's/^/            /'
+              failed=$((failed+1)); failed_list="${failed_list}- \`${n}\`\n"
+            elif grep -q "previously applied" <<<"$out"; then
+              echo "REDUNDANT ${n}  <-- already upstream; move to obsolete-upstream/"
+              redundant=$((redundant+1)); redundant_list="${redundant_list}- \`${n}\`\n"
+            else
+              echo "fuzz      ${n}"
+              fuzzed=$((fuzzed+1))
+            fi
+          done
+
+          echo "---"
+          echo "clean: ${clean}  fuzz<=${EAPPLY_FUZZ}: ${fuzzed}  redundant: ${redundant}  failed: ${failed}"
+
+          if [ ${failed} -gt 0 ]; then
+            {
+              echo "### :x: Patch stack no longer applies"
+              echo
+              echo "These hard-failed. The real build calls \`eapply\`, which runs"
+              echo "\`patch\` at fuzz ${EAPPLY_FUZZ}, so this build would break:"
+              echo
+              echo -e "${failed_list}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ ${redundant} -gt 0 ]; then
+            {
+              echo "### :warning: Patches are now upstream"
+              echo
+              echo "\`patch\` reports these as already applied. \`eapply\` does not pass"
+              echo "\`--forward\`, so the real build fails rather than skipping them."
+              echo "Move them to \`obsolete-upstream/\` and record the provenance:"
+              echo
+              echo -e "${redundant_list}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "### :white_check_mark: Patch stack applies"
+            echo
+            echo "| result | count |"
+            echo "|---|---|"
+            echo "| clean | ${clean} |"
+            echo "| fuzz <= ${EAPPLY_FUZZ} | ${fuzzed} |"
+            echo "| failed | 0 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Assert the T2 config symbols resolve
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/k"
+          # Each symbol must be defined by a Kconfig file after patching,
+          # otherwise the CONFIG_* lines in kconfig/t2 silently do nothing.
+          rc=0
+          check() {
+            if grep -q "^config $1$" "$2"; then
+              echo "ok      $1  ($2)"
+            else
+              echo "::error::$1 not defined in $2"
+              rc=1
+            fi
+          }
+          check APPLE_BCE                 drivers/staging/apple-bce/Kconfig
+          check HID_APPLE_IBRIDGE         drivers/hid/Kconfig
+          check HID_APPLE_TOUCHBAR        drivers/hid/Kconfig
+          check HID_APPLE_MAGIC_BACKLIGHT drivers/hid/Kconfig
+          check BT_HCIBCM4377             drivers/bluetooth/Kconfig
+          echo "--- fragment symbols ---"
+          grep -E '^CONFIG_' "$GITHUB_WORKSPACE/kconfig/t2"
+          exit $rc
+
+      - name: Assert the T2 driver sources exist
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/k"
+          rc=0
+          for f in \
+            drivers/staging/apple-bce/apple_bce.c \
+            drivers/hid/apple-ibridge.c \
+            drivers/hid/apple-touchbar.c \
+            drivers/hid/apple-magic-backlight.c \
+            drivers/bluetooth/hci_bcm4377.c ; do
+            if [ -f "$f" ]; then echo "ok      ${f}"; else echo "::error::missing ${f}"; rc=1; fi
+          done
+          exit $rc
+
+  upstream-drift:
+    name: Override ebuild still wins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream has not moved past 6.1.25
+        run: |
+          set -euo pipefail
+          # The override only applies if it is the highest revision of the
+          # highest version. If upstream publishes 6.1.26, portage selects
+          # that instead, our files/*.patch are never read, and the image
+          # silently builds without T2 support.
+          UPSTREAM_REF=release-R114-15437.B-openfyde
+          url="https://api.github.com/repos/openFyde/chromiumos-overlay/contents/sys-kernel/chromeos-kernel-6_1?ref=${UPSTREAM_REF}"
+          curl -sSL -H "Accept: application/vnd.github+json" "$url" \
+            | grep -o '"name": *"chromeos-kernel-6_1-[^"]*\.ebuild"' \
+            | sed 's/.*"\(chromeos-kernel-6_1-[^"]*\)"/\1/' | sort -V > /tmp/upstream.txt || true
+
+          echo "upstream ebuilds:"
+          sed 's/^/  /' /tmp/upstream.txt
+          echo "our override:"
+          ls sys-kernel/chromeos-kernel-6_1/*.ebuild | xargs -n1 basename | sed 's/^/  /'
+
+          highest=$(grep -v -- '-9999' /tmp/upstream.txt | sort -V | tail -1)
+          echo "highest upstream: ${highest}"
+
+          if echo "${highest}" | grep -q '6\.1\.25-'; then
+            echo "::notice::upstream is still on 6.1.25 -- the r228 override still wins"
+          else
+            {
+              echo "### :rotating_light: Upstream kernel moved"
+              echo
+              echo "Upstream now ships \`${highest}\`, which outranks this board's"
+              echo "\`chromeos-kernel-6_1-6.1.25-r228.ebuild\`. Portage will pick"
+              echo "upstream, FILESDIR will point at upstream's empty \`files/\`, and"
+              echo "**the T2 patches will silently not apply**."
+              echo
+              echo "Re-copy the new upstream ebuild here, bump its revision by one,"
+              echo "and re-verify the patch stack."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+  repo-hygiene:
+    name: Repo hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No CRLF anywhere
+        run: |
+          set -euo pipefail
+          # A core.autocrlf checkout on Windows silently breaks git apply,
+          # shell shebangs and sourced make.conf. See .gitattributes.
+          if grep -rIl $'\r' --exclude-dir=.git . ; then
+            echo "::error::CRLF line endings found in the files listed above"
+            echo "These must be LF. See .gitattributes."
+            exit 1
+          fi
+          echo "all files LF"
+
+      - name: Shell scripts are executable and parse
+        run: |
+          set -euo pipefail
+          rc=0
+          while IFS= read -r s; do
+            if [ ! -x "$s" ]; then echo "::error file=$s::not executable (needs 100755)"; rc=1; fi
+            bash -n "$s" || rc=1
+            echo "ok      $s"
+          done < <(find . -name '*.sh' -not -path './.git/*')
+          exit $rc
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          find . -name '*.sh' -not -path './.git/*' -print0 \
+            | xargs -0 -r shellcheck --severity=warning
+
+      - name: Override ebuild body matches upstream
+        run: |
+          set -euo pipefail
+          UPSTREAM_REF=release-R114-15437.B-openfyde
+          base="https://raw.githubusercontent.com/openFyde/chromiumos-overlay/${UPSTREAM_REF}/sys-kernel/chromeos-kernel-6_1"
+          curl -sSL "${base}/chromeos-kernel-6_1-6.1.25-r227.ebuild" -o /tmp/up.ebuild
+
+          override="sys-kernel/chromeos-kernel-6_1/chromeos-kernel-6_1-6.1.25-r228.ebuild"
+          # The override is upstream's body verbatim, behind a comment header
+          # that ends in a separator line. Compare only what follows it.
+          sed '1,/^# -\{10,\}$/d' "$override" > /tmp/our.body
+          tail -n +3 /tmp/up.ebuild > /tmp/up.body
+
+          if diff -u /tmp/up.body /tmp/our.body; then
+            echo "override body is identical to upstream r227 (only the header differs)"
+          else
+            echo "::error::override ebuild body has drifted from upstream"
+            echo "Re-copy upstream's ebuild and bump the revision. See README.t2.md."
+            exit 1
+          fi
